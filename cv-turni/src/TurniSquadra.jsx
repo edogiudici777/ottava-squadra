@@ -24,7 +24,7 @@ const SOTTOTITOLO = "Croce Verde · Milano";     // sottotitolo sotto il nome
 const PIN_CAPO = "1854";                         // PIN area caposquadra (cambialo per ogni squadra)
 
 /* ---------- Config dominio ---------- */
-const CICLO_START = "2026-11-27";   // primo turno notturno
+const CICLO_START = "2026-06-24";   // primo turno notturno
 const CICLO_GIORNI = 10;            // un turno ogni 10 giorni
 const GIORNI_AVANTI = 90;           // genera i turni fino a ~3 mesi nel futuro
 const EQUIPAGGI_PER_META = 2;       // 2 equipaggi prima, 2 dopo mezzanotte
@@ -163,6 +163,7 @@ const KEY_PUBLISHED = "cv:published";     // { [turnoId]: { at:iso, message:stri
 const KEY_REPORTS = "cv:reports";         // { [YYYY-MM]: { nturni, persone:{ [cognome]: {...counts} } } } — override/storico
 const KEY_IMPORTED = "cv:imported";       // { done: bool } — flag storico già importato
 const KEY_EMOJIS = "cv:emojis";           // { [personId]: "🦊" } — avatar scelto da ciascuno
+const KEY_MANUAL = "cv:manual";           // [ "2026-12-25:diurna", ... ] — turni creati a mano dal capo
 
 async function sget(key, fallback) {
   try {
@@ -229,6 +230,7 @@ export default function App() {
   const [reports, setReports] = useState({});
   const [imported, setImported] = useState({});
   const [emojis, setEmojis] = useState({});
+  const [manualTurni, setManualTurni] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saveState, setSaveState] = useState("idle"); // idle | saving | saved | error
 
@@ -238,8 +240,15 @@ export default function App() {
     // quanti cicli da CICLO_START fino a end (almeno 6, per sicurezza)
     const giorni = Math.max(0, Math.round((end - start) / (1000 * 60 * 60 * 24)));
     const n = Math.max(6, Math.ceil(giorni / CICLO_GIORNI) + 1);
-    return genTurni(CICLO_START, n);
-  }, []);
+    const generati = genTurni(CICLO_START, n);
+    // aggiungo i turni creati a mano dal capo (se non coincidono con un generato)
+    const byId = {};
+    generati.forEach((t) => { byId[t.id] = t; });
+    (manualTurni || []).forEach((id) => {
+      if (!byId[id]) { const t = turnoFromId(id); t.manuale = true; byId[id] = t; }
+    });
+    return Object.values(byId).sort((a, b) => a.date - b.date || (a.kind === "notte" ? -1 : 1));
+  }, [manualTurni]);
 
   // load
   useEffect(() => {
@@ -254,6 +263,7 @@ export default function App() {
       const rep = await sget(KEY_REPORTS, {});
       const imp = await sget(KEY_IMPORTED, {});
       const emo = await sget(KEY_EMOJIS, {});
+      const man = await sget(KEY_MANUAL, []);
       setPeople(p);
       setAvailability(a);
       setAssignments(as);
@@ -264,6 +274,7 @@ export default function App() {
       setReports(rep);
       setImported(imp);
       setEmojis(emo);
+      setManualTurni(Array.isArray(man) ? man : []);
       setLoading(false);
     })();
   }, []);
@@ -352,6 +363,26 @@ export default function App() {
   const savePublished = (next) => { setPublished(next); persist(KEY_PUBLISHED, next); };
   const saveReports = (next) => { setReports(next); persist(KEY_REPORTS, next); };
   const saveEmojis = (next) => { setEmojis(next); persist(KEY_EMOJIS, next); };
+  // crea un turno manuale (data + tipo). addManualTurno("2026-12-25", "diurna")
+  const addManualTurno = (dateISO, kind) => {
+    const id = kind === "diurna" ? `${dateISO}:diurna` : dateISO;
+    if (manualTurni.includes(id)) return id; // già esiste
+    const next = [...manualTurni, id];
+    setManualTurni(next); persist(KEY_MANUAL, next);
+    return id;
+  };
+  // rimuove un turno manuale e i suoi dati
+  const removeManualTurno = (id) => {
+    const next = manualTurni.filter((x) => x !== id);
+    setManualTurni(next); persist(KEY_MANUAL, next);
+    // pulisco anche i dati collegati a quel turno
+    const cleanObj = (obj, saver, key) => { if (obj && obj[id]) { const n = { ...obj }; delete n[id]; saver(n); } };
+    cleanObj(assignments, saveAssign, KEY_ASSIGN);
+    cleanObj(galley, saveGalley, KEY_GALLEY);
+    cleanObj(config, saveConfig, KEY_CONFIG);
+    cleanObj(published, savePublished, KEY_PUBLISHED);
+    cleanObj(availability, saveAvail, KEY_AVAIL);
+  };
   const saveImported = (next) => { setImported(next); persist(KEY_IMPORTED, next); };
 
   // numero equipaggi per metà di un turno (default EQUIPAGGI_PER_META).
@@ -406,6 +437,8 @@ export default function App() {
             people={peopleE}
             savePeople={savePeople}
             savePeopleMerge={savePeopleMerge}
+            addManualTurno={addManualTurno}
+            removeManualTurno={removeManualTurno}
             availability={availability}
             assignments={assignments}
             saveAssign={saveAssign}
@@ -1349,21 +1382,8 @@ function ArchivioCapo({ turni, people, availability, assignments, crewsFor, publ
     [...Object.keys(assignments || {}), ...Object.keys(published || {})].forEach((id) => {
       if (!byId[id]) byId[id] = turnoFromId(id);
     });
-    // un turno è "con equipaggio" se almeno una persona è assegnata (equipaggi o centralino)
-    const hasCrew = (id) => {
-      const a = assignments?.[id];
-      if (!a) return false;
-      const inCrews = ["pre", "post"].some((half) =>
-        (a[half] || []).some((c) => c && (c.autista || c.capo || (c.soccorritori || []).some(Boolean)))
-      );
-      if (inCrews) return true;
-      const c = a.centralino;
-      if (Array.isArray(c)) return c.some(Boolean);
-      return !!c && ["pre", "post"].some((h) => (c[h]?.people || []).some(Boolean));
-    };
     return Object.values(byId)
       .filter((t) => !stillActive(t))
-      .filter((t) => hasCrew(t.id)) // nascondo i turni passati rimasti vuoti
       .sort((a, b) => b.date - a.date);
   }, [turni, assignments, published]);
   const [open, setOpen] = useState(null);
@@ -1888,7 +1908,76 @@ function autoGalley(turni, people, availability, existing) {
 }
 
 /* ---------- vista turni caposquadra ---------- */
-function TurniCapo({ turni, people, availability, assignments, saveAssign, galley, saveGalley, config, saveConfig, crewsFor, alerts, saveAlerts, published, savePublished }) {
+/* ---------- modale: crea un turno manuale scegliendo data e tipo ---------- */
+function NuovoTurnoModal({ onClose, onCreate, esistenti }) {
+  const oggi = new Date();
+  const [mese, setMese] = useState(new Date(oggi.getFullYear(), oggi.getMonth(), 1));
+  const [sel, setSel] = useState(null); // data scelta (Date)
+  const [kind, setKind] = useState("notte");
+
+  const primoGiorno = new Date(mese.getFullYear(), mese.getMonth(), 1);
+  const giorniNelMese = new Date(mese.getFullYear(), mese.getMonth() + 1, 0).getDate();
+  const offset = (primoGiorno.getDay() + 6) % 7; // lun=0
+  const celle = [];
+  for (let i = 0; i < offset; i++) celle.push(null);
+  for (let g = 1; g <= giorniNelMese; g++) celle.push(new Date(mese.getFullYear(), mese.getMonth(), g));
+
+  const selISO = sel ? toISO(sel) : null;
+  const idSeScelgo = selISO ? (kind === "diurna" ? `${selISO}:diurna` : selISO) : null;
+  const giaEsiste = idSeScelgo && esistenti.includes(idSeScelgo);
+
+  return (
+    <div style={S.modalOverlay} onClick={onClose}>
+      <div style={S.modalBox} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+          <h3 style={{ margin: 0, fontSize: 18, color: "var(--ink)" }}>➕ Nuovo turno</h3>
+          <button className="tap" style={S.modalClose} onClick={onClose}>✕</button>
+        </div>
+        <p style={{ ...S.helper, marginTop: 0 }}>Scegli il giorno (es. una festività infrasettimanale) e se è notturna o diurna.</p>
+
+        {/* navigazione mese */}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+          <button className="tap" style={S.calNav} onClick={() => setMese(new Date(mese.getFullYear(), mese.getMonth() - 1, 1))}>‹</button>
+          <b style={{ textTransform: "capitalize" }}>{mese.toLocaleDateString("it-IT", { month: "long", year: "numeric" })}</b>
+          <button className="tap" style={S.calNav} onClick={() => setMese(new Date(mese.getFullYear(), mese.getMonth() + 1, 1))}>›</button>
+        </div>
+        {/* intestazione giorni */}
+        <div style={S.calGrid}>
+          {["L", "M", "M", "G", "V", "S", "D"].map((d, i) => (
+            <div key={i} style={{ textAlign: "center", fontSize: 11, color: "var(--ink-soft)", fontWeight: 700 }}>{d}</div>
+          ))}
+          {celle.map((d, i) => {
+            if (!d) return <div key={i} />;
+            const isSel = sel && toISO(sel) === toISO(d);
+            return (
+              <button key={i} className="tap"
+                style={{ ...S.calDay, ...(isSel ? S.calDaySel : {}) }}
+                onClick={() => setSel(d)}>{d.getDate()}</button>
+            );
+          })}
+        </div>
+
+        {/* tipo turno */}
+        <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+          <button className="tap" style={{ ...S.typeBtn, ...(kind === "notte" ? S.typeBtnOn : {}) }} onClick={() => setKind("notte")}>🌙 Notturna</button>
+          <button className="tap" style={{ ...S.typeBtn, ...(kind === "diurna" ? S.typeBtnOn : {}) }} onClick={() => setKind("diurna")}>🌅 Diurna</button>
+        </div>
+
+        {giaEsiste && <p style={{ color: "var(--c-absent)", fontSize: 13, marginTop: 10 }}>⚠️ Esiste già un turno di quel tipo in questa data.</p>}
+
+        <button className="tap"
+          style={{ ...S.primaryBtn, width: "100%", marginTop: 16, opacity: (!sel || giaEsiste) ? 0.5 : 1 }}
+          disabled={!sel || giaEsiste}
+          onClick={() => sel && !giaEsiste && onCreate(toISO(sel), kind)}>
+          Crea il turno
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function TurniCapo({ turni, people, availability, assignments, saveAssign, galley, saveGalley, config, saveConfig, crewsFor, alerts, saveAlerts, published, savePublished, addManualTurno, removeManualTurno }) {
+  const [showNuovo, setShowNuovo] = useState(false);
   const [open, setOpen] = useState(turni[0]?.id);
   const pById = useMemo(() => Object.fromEntries(people.map((p) => [p.id, p])), [people]);
 
@@ -1938,7 +2027,16 @@ function TurniCapo({ turni, people, availability, assignments, saveAssign, galle
           <h2 style={{ ...S.h2, margin: 0 }}>Turni & equipaggi</h2>
           <p style={{ ...S.helper, margin: "2px 0 0" }}>Imposta quanti equipaggi servono per ogni metà (default {EQUIPAGGI_PER_META}+{EQUIPAGGI_PER_META}). Ogni equipaggio è autista + capo + 2 soccorritori. La proposta automatica è dentro ogni turno, così non tocca gli altri.</p>
         </div>
+        <button className="tap" style={S.primaryBtn} onClick={() => setShowNuovo(true)}>➕ Nuovo turno</button>
       </div>
+
+      {showNuovo && (
+        <NuovoTurnoModal
+          onClose={() => setShowNuovo(false)}
+          onCreate={(dateISO, kind) => { addManualTurno(dateISO, kind); setShowNuovo(false); setOpen(kind === "diurna" ? `${dateISO}:diurna` : dateISO); }}
+          esistenti={turni.map((t) => t.id)}
+        />
+      )}
 
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
         {turni.filter((t) => stillActive(t)).map((t) => {
@@ -1968,10 +2066,17 @@ function TurniCapo({ turni, people, availability, assignments, saveAssign, galle
                     </div>
                   )}
 
-                  <div style={{ marginBottom: 14 }}>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 14 }}>
                     <button className="tap" style={S.primaryBtn} onClick={() => runAutoOne(t.id)}>⚡ Proposta automatica per questo turno</button>
-                    <p style={{ ...S.helper, margin: "6px 0 0" }}>Riempie gli equipaggi e la cambusa solo di questo turno, in base alle disponibilità. Non tocca gli altri turni.</p>
+                    {t.manuale && (
+                      <button className="tap" style={S.dangerBtn}
+                        onClick={() => { if (window.confirm("Cancellare questo turno creato a mano e tutti i suoi dati? L'azione non si annulla.")) removeManualTurno(t.id); }}>
+                        🗑️ Cancella turno
+                      </button>
+                    )}
+                    {t.manuale && <span style={S.manualTag}>turno creato a mano</span>}
                   </div>
+                  <p style={{ ...S.helper, margin: "-8px 0 14px" }}>La proposta automatica riempie gli equipaggi e la cambusa solo di questo turno. Non tocca gli altri.</p>
 
                   {HALF_KEYS.map((half) => {
                     const nCrews = crewsFor(t.id, half);
@@ -3455,6 +3560,17 @@ const S = {
   toolbar: { display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 14, marginBottom: 18, flexWrap: "wrap" },
   primaryBtn: { background: "var(--cv)", color: "#fff", border: 0, padding: "12px 18px", borderRadius: 11, fontWeight: 700, fontSize: 14 },
   backupBtn: { background: "var(--panel-2)", color: "var(--ink)", border: "1px solid var(--line)", padding: "12px 18px", borderRadius: 11, fontWeight: 700, fontSize: 14 },
+  dangerBtn: { background: "rgba(226,87,76,.12)", color: "var(--c-absent)", border: "1px solid var(--c-absent)", padding: "10px 14px", borderRadius: 10, fontWeight: 700, fontSize: 13 },
+  manualTag: { fontSize: 11, color: "var(--ink-soft)", fontStyle: "italic" },
+  modalOverlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,.5)", zIndex: 9998, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 },
+  modalBox: { background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 18, padding: 20, maxWidth: 380, width: "100%", maxHeight: "90vh", overflowY: "auto" },
+  modalClose: { background: "var(--panel-2)", border: "1px solid var(--line)", borderRadius: 8, width: 32, height: 32, color: "var(--ink-soft)", fontSize: 14 },
+  calNav: { background: "var(--panel-2)", border: "1px solid var(--line)", borderRadius: 8, width: 36, height: 36, fontSize: 18, color: "var(--ink)" },
+  calGrid: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4 },
+  calDay: { aspectRatio: "1", background: "var(--panel-2)", border: "1px solid var(--line)", borderRadius: 8, color: "var(--ink)", fontSize: 14, cursor: "pointer" },
+  calDaySel: { background: "var(--cv)", color: "#fff", borderColor: "var(--cv)", fontWeight: 800 },
+  typeBtn: { flex: 1, background: "var(--panel-2)", border: "1px solid var(--line)", borderRadius: 10, padding: "10px", color: "var(--ink-soft)", fontSize: 14, fontWeight: 700 },
+  typeBtnOn: { background: "var(--cv)", color: "#fff", borderColor: "var(--cv)" },
 
   accordion: { background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 14, overflow: "hidden" },
   accHead: { width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", padding: "16px 18px", background: "transparent", border: 0, color: "var(--ink)" },
