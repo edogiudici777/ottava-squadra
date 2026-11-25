@@ -24,7 +24,7 @@ const SOTTOTITOLO = "Croce Verde · Milano";     // sottotitolo sotto il nome
 const PIN_CAPO = "1854";                         // PIN area caposquadra (cambialo per ogni squadra)
 
 /* ---------- Config dominio ---------- */
-const CICLO_START = "2026-06-24";   // primo turno notturno
+const CICLO_START = "2026-11-27";   // primo turno notturno
 const CICLO_GIORNI = 10;            // un turno ogni 10 giorni
 const GIORNI_AVANTI = 90;           // genera i turni fino a ~3 mesi nel futuro
 const EQUIPAGGI_PER_META = 2;       // 2 equipaggi prima, 2 dopo mezzanotte
@@ -1349,8 +1349,21 @@ function ArchivioCapo({ turni, people, availability, assignments, crewsFor, publ
     [...Object.keys(assignments || {}), ...Object.keys(published || {})].forEach((id) => {
       if (!byId[id]) byId[id] = turnoFromId(id);
     });
+    // un turno è "con equipaggio" se almeno una persona è assegnata (equipaggi o centralino)
+    const hasCrew = (id) => {
+      const a = assignments?.[id];
+      if (!a) return false;
+      const inCrews = ["pre", "post"].some((half) =>
+        (a[half] || []).some((c) => c && (c.autista || c.capo || (c.soccorritori || []).some(Boolean)))
+      );
+      if (inCrews) return true;
+      const c = a.centralino;
+      if (Array.isArray(c)) return c.some(Boolean);
+      return !!c && ["pre", "post"].some((h) => (c[h]?.people || []).some(Boolean));
+    };
     return Object.values(byId)
       .filter((t) => !stillActive(t))
+      .filter((t) => hasCrew(t.id)) // nascondo i turni passati rimasti vuoti
       .sort((a, b) => b.date - a.date);
   }, [turni, assignments, published]);
   const [open, setOpen] = useState(null);
